@@ -1,40 +1,51 @@
 # INLABS API
 
-API intermediária que faz o trabalho frágil (login no INLABS, download do DOU,
-unzip e parse do XML) a partir de um **IP dedicado**, devolvendo JSON pronto para
-o Google Apps Script consumir. Resolve o bloqueio `#01` que acontece quando o
-Apps Script bate no INLABS pelos IPs compartilhados do Google.
+API HTTP que expõe os atos normativos do **Diário Oficial da União (DOU)** como
+JSON limpo. Ela faz o trabalho chato — autenticar no [INLABS](https://inlabs.in.gov.br),
+baixar o pacote do dia, descompactar e parsear os XMLs — e devolve os itens já
+normalizados, prontos para qualquer cliente consumir (integrações, bots, planilhas,
+pipelines de dados, etc.).
 
-## Por que isso mitiga o rate limit
+O ganho principal é rodar isso a partir de **um IP dedicado e estável**, com cache,
+em vez de cada cliente bater direto no INLABS (o que costuma levar a bloqueios por
+excesso de requisições).
 
-- **IP dedicado** (a VM/Railway) em vez dos IPs compartilhados do Google.
-- **Sessão logada reaproveitada** por `SESSION_TTL_MIN` — não faz login por request.
-- **Cache por edição em SQLite** (persistido no volume), baseado na cadência real do DOU:
-  - **DO1** sai 1x por dia útil, de manhã, e não muda depois → edição passada é
-    cacheada **para sempre**; DO1 de hoje já baixada fica estável por 6h.
-  - **DO1E** (extra) é irregular e pode surgir/crescer no dia → cache de 1h.
-  - DO1 de hoje ainda não publicada → retry curto de 20min.
-- **Detecção de bloqueio**: ao ver `#01`, a API para de tocar no INLABS por
-  `BLOCK_BACKOFF_MIN` e passa a servir o último cache conhecido (stale).
+## Como funciona
+
+- **Login com sessão reaproveitada** por `SESSION_TTL_MIN` — não autentica a cada request.
+- **Cache por edição em SQLite** (persistido em disco/volume), com TTL baseado na
+  cadência real do DOU:
+  - **DO1** (Seção 1) sai 1x por dia útil, de manhã, e não muda depois → edição
+    passada é cacheada **para sempre**; a de hoje, já publicada, fica estável por 6h.
+  - **DO1E** (edição extra) é irregular e pode surgir/crescer no dia → cache de 1h.
+  - DO1 de hoje ainda não publicada → novo retry em 20min.
+- **Proteção contra bloqueio**: ao detectar bloqueio temporário do INLABS, a API
+  para de tocar nele por `BLOCK_BACKOFF_MIN` e passa a servir o último cache conhecido.
 
 ## Endpoints
 
-Todos (exceto `/health` e `/`) exigem o header `X-API-Key`.
+Todos, exceto `/health` e `/`, exigem o header `X-API-Key` (quando `API_KEY` está definida).
 
 | Método | Rota | Descrição |
 |--------|------|-----------|
 | GET | `/health` | Healthcheck (sem auth). |
-| GET | `/federal` | Hoje + ontem, todas as seções. **É o que o Apps Script chama.** |
-| GET | `/norms?date=YYYY-MM-DD&sections=DO1,DO1E` | Data/seções específicas. |
+| GET | `/federal` | Itens de hoje + ontem, todas as seções configuradas. |
+| GET | `/norms?date=YYYY-MM-DD&sections=DO1,DO1E` | Data e seções específicas. |
 
-Resposta (`/federal`):
+### Exemplo
+
+```bash
+curl -H "X-API-Key: SUA_CHAVE" https://SEU-HOST/federal
+```
+
+### Formato da resposta
 
 ```json
 {
   "status": "ok",            // ok | degraded | blocked
   "generatedAt": "2026-07-09T22:00:00+00:00",
   "count": 42,
-  "sections": [{"date":"2026-07-09","secao":"DO1","count":40,"cached":true}],
+  "sections": [{"date": "2026-07-09", "secao": "DO1", "count": 40, "cached": true}],
   "blockedUntil": null,
   "items": [
     {
@@ -56,66 +67,53 @@ Resposta (`/federal`):
 }
 ```
 
+Campo `status`:
+- `ok` — dados atuais do INLABS (ou cache válido).
+- `degraded` — INLABS indisponível/bloqueado; servindo cache anterior.
+- `blocked` — INLABS bloqueado e sem cache para servir.
+
 ## Variáveis de ambiente
 
-Ver `.env.example`. As obrigatórias: `INLABS_EMAIL`, `INLABS_PASSWORD`, `API_KEY`.
+Veja `.env.example`. Obrigatórias: `INLABS_EMAIL`, `INLABS_PASSWORD`, `API_KEY`.
 
-## Deploy no Railway
+| Variável | Padrão | Descrição |
+|----------|--------|-----------|
+| `INLABS_EMAIL` | — | E-mail da conta INLABS. |
+| `INLABS_PASSWORD` | — | Senha da conta INLABS. |
+| `API_KEY` | — | Chave exigida no header `X-API-Key`. Se vazia, a API fica aberta. |
+| `DATA_DIR` | `./data` | Diretório do banco SQLite. |
+| `SECTIONS` | `DO1,DO1E` | Seções coletadas. |
+| `TZ` | `America/Sao_Paulo` | Fuso para determinar "hoje"/"ontem". |
+| `SESSION_TTL_MIN` | `30` | Minutos que a sessão logada é reaproveitada. |
+| `BLOCK_BACKOFF_MIN` | `120` | Minutos de pausa ao detectar bloqueio. |
 
-1. Suba este diretório para um repositório Git e conecte no Railway (New Project → Deploy from repo).
-2. Em **Variables**, defina `INLABS_EMAIL`, `INLABS_PASSWORD`, `API_KEY`, e `DATA_DIR=/data`.
-3. Crie um **Volume** e monte no caminho **`/data`** — é onde o SQLite persiste (`/data/inlabs.db`),
-   sobrevivendo a redeploys. (Sem volume, o cache ainda funciona, mas zera a cada deploy.)
-4. O Railway detecta Python pelo `.python-version`/`requirements.txt` e usa o `Procfile`
-   (`uvicorn app.main:app --host 0.0.0.0 --port $PORT`). Nada mais a configurar.
+> As credenciais do INLABS ficam **somente no ambiente**, nunca no código.
 
-## Rodar local
+## Rodar localmente
 
 ```bash
-python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
-INLABS_EMAIL=... INLABS_PASSWORD=... API_KEY=secret .venv/Scripts/uvicorn app.main:app --reload
+python -m venv .venv
+.venv/Scripts/pip install -r requirements.txt   # Linux/Mac: .venv/bin/pip
+cp .env.example .env                              # e preencha os valores
+.venv/Scripts/uvicorn app.main:app --reload      # Linux/Mac: .venv/bin/uvicorn
 ```
 
-## Ligar no Apps Script
+Docs interativas (Swagger UI) em `http://127.0.0.1:8000/docs`.
 
-Substitua a função `collectFederalFromInlabs_` do projeto Apps Script por esta —
-o resto do pipeline (filtros, dedup, Chat, planilha) continua igual. As credenciais
-do INLABS saem do Apps Script e passam a viver só na API.
+## Deploy
 
-```javascript
-function collectFederalFromInlabs_(config) {
-  var props = PropertiesService.getScriptProperties();
-  var base = (props.getProperty('FEDERAL_API_URL') || '').replace(/\/$/, '');
-  var key = props.getProperty('FEDERAL_API_KEY') || '';
-  if (!base) {
-    Logger.log('FEDERAL_API_URL não configurada — eixo federal ignorado.');
-    return [];
-  }
+A aplicação é um serviço ASGI padrão (`app.main:app`), sem dependências além das do
+`requirements.txt`. Funciona em qualquer plataforma que rode Python.
 
-  var resp = UrlFetchApp.fetch(base + '/federal', {
-    method: 'get',
-    muteHttpExceptions: true,
-    headers: key ? { 'X-API-Key': key } : {}
-  });
+Comando de start:
 
-  var code = resp.getResponseCode();
-  if (code !== 200) {
-    throw new Error('API federal HTTP ' + code + ': ' + resp.getContentText().slice(0, 200));
-  }
-
-  var data = JSON.parse(resp.getContentText());
-  if (data.status === 'blocked') {
-    // Reaproveita a supressão de alerta de manutenção (1x a cada 6h).
-    throw inlabsMaintenanceError_();
-  }
-
-  return (data.items || []).map(function (it) {
-    it.publishedAt = it.publishedIso ? new Date(it.publishedIso) : null;
-    return it;
-  });
-}
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
-Configure nas **Propriedades do Script**: `FEDERAL_API_URL` (ex.: `https://seu-app.up.railway.app`)
-e `FEDERAL_API_KEY` (o mesmo valor do `API_KEY` da API). `INLABS_EMAIL`/`INLABS_PASSWORD`
-podem ser removidas do Apps Script.
+Para o cache persistir entre reinícios/deploys, aponte `DATA_DIR` para um diretório
+persistente (um volume). Sem isso, o cache ainda funciona, mas zera a cada deploy.
+
+## Stack
+
+FastAPI · Uvicorn · Requests · SQLite (stdlib). Python 3.12+.
