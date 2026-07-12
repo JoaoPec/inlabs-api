@@ -2,6 +2,17 @@
 
 API HTTP que busca atos normativos do Diário Oficial da União (DOU) via INLABS e devolve JSON limpo. Faz autenticação, download dos ZIPs, parse dos XMLs e cache em SQLite.
 
+O ganho principal é rodar a partir de um IP dedicado e estável, com cache, em vez de cada cliente bater direto no INLABS (o que costuma levar a bloqueios por excesso de requisições).
+
+## Como funciona
+
+- **Login com sessão reaproveitada** por `SESSION_TTL_MIN` — não autentica a cada request. A sessão logada fica viva por N minutos e é compartilhada entre todas as requisições, evitando batidas desnecessárias no endpoint de login.
+- **Cache por edição em SQLite** (persistido em disco/volume), com TTL baseado na cadência real do DOU:
+  - **DO1** (Seção 1) sai 1x por dia útil, de manhã, e não muda depois → edição passada é cacheada **para sempre**; a de hoje, já publicada, fica estável por 6h.
+  - **DO1E** (edição extra) é irregular e pode surgir/crescer no dia → cache de 1h.
+  - DO1 de hoje ainda não publicada → retry a cada 20 min.
+- **Proteção contra bloqueio**: ao detectar bloqueio temporário do INLABS (`#01` / "tente mais tarde"), a API para de tocar nele por `BLOCK_BACKOFF_MIN` e passa a servir o último cache conhecido (stale). Se não houver cache nenhum, retorna status `blocked`.
+
 ## Rodar na máquina (desenvolvimento)
 
 ```bash
