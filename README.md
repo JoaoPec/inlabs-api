@@ -1,119 +1,214 @@
 # INLABS API
 
-API HTTP que expõe os atos normativos do **Diário Oficial da União (DOU)** como
-JSON limpo. Ela faz o trabalho chato — autenticar no [INLABS](https://inlabs.in.gov.br),
-baixar o pacote do dia, descompactar e parsear os XMLs — e devolve os itens já
-normalizados, prontos para qualquer cliente consumir (integrações, bots, planilhas,
-pipelines de dados, etc.).
+API HTTP que busca atos normativos do Diário Oficial da União (DOU) via INLABS e devolve JSON limpo. Faz autenticação, download dos ZIPs, parse dos XMLs e cache em SQLite.
 
-O ganho principal é rodar isso a partir de **um IP dedicado e estável**, com cache,
-em vez de cada cliente bater direto no INLABS (o que costuma levar a bloqueios por
-excesso de requisições).
+## Rodar na máquina (desenvolvimento)
 
-## Como funciona
+```bash
+# 1. Clone o repo
+git clone <repo-url>
+cd inlabs-api
 
-- **Login com sessão reaproveitada** por `SESSION_TTL_MIN` — não autentica a cada request.
-- **Cache por edição em SQLite** (persistido em disco/volume), com TTL baseado na
-  cadência real do DOU:
-  - **DO1** (Seção 1) sai 1x por dia útil, de manhã, e não muda depois → edição
-    passada é cacheada **para sempre**; a de hoje, já publicada, fica estável por 6h.
-  - **DO1E** (edição extra) é irregular e pode surgir/crescer no dia → cache de 1h.
-  - DO1 de hoje ainda não publicada → novo retry em 20min.
-- **Proteção contra bloqueio**: ao detectar bloqueio temporário do INLABS, a API
-  para de tocar nele por `BLOCK_BACKOFF_MIN` e passa a servir o último cache conhecido.
+# 2. Crie o ambiente virtual (Python 3.12+)
+python -m venv .venv
+
+# 3. Ative o venv e instale as dependências
+# Linux/Mac:
+.venv/bin/pip install -r requirements.txt
+# Windows:
+.venv\Scripts\pip install -r requirements.txt
+
+# 4. Configure as variáveis de ambiente
+cp .env.example .env
+# Edite o .env com suas credenciais INLABS e defina uma API_KEY
+nano .env   # ou use o bloco de notas
+
+# 5. Rode o servidor
+# Linux/Mac:
+.venv/bin/uvicorn app.main:app --reload
+# Windows:
+.venv\Scripts\uvicorn app.main:app --reload
+
+# API disponível em http://127.0.0.1:8000
+# Swagger em http://127.0.0.1:8000/docs
+```
+
+## Subir no servidor (VPS / produção)
+
+### 1. Preparação
+
+```bash
+# Na VPS, clone o repo em /opt
+cd /opt
+git clone <repo-url> inlabs-api
+cd inlabs-api
+
+# Crie o venv e instale
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# Configure o .env
+cp .env.example .env
+nano .env   # preencha INLABS_EMAIL, INLABS_PASSWORD e API_KEY
+```
+
+### 2. Serviço systemd (roda em background, reinicia sozinho)
+
+Crie o arquivo `/etc/systemd/system/inlabs-api.service`:
+
+```ini
+[Unit]
+Description=INLABS API
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/inlabs-api
+EnvironmentFile=/opt/inlabs-api/.env
+ExecStart=/opt/inlabs-api/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now inlabs-api
+
+# Verificar se está rodando
+sudo systemctl status inlabs-api
+curl http://127.0.0.1:8000/health
+```
+
+### 3. Nginx reverso (HTTPS + domínio)
+
+```nginx
+server {
+    listen 80;
+    server_name api.seudominio.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+```bash
+sudo ln -s /etc/nginx/sites-available/inlabs-api /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+
+# HTTPS com Certbot (Let's Encrypt)
+sudo certbot --nginx -d api.seudominio.com
+```
+
+## Variáveis de ambiente
+
+Copie `.env.example` para `.env` e preencha:
+
+| Variável | Obrigatória | Padrão | Descrição |
+|---|---|---|---|
+| `INLABS_EMAIL` | Sim | — | E-mail da conta INLABS |
+| `INLABS_PASSWORD` | Sim | — | Senha da conta INLABS |
+| `API_KEY` | Sim | — | Chave que os clientes enviam no header `X-API-Key` |
+| `DATA_DIR` | Não | `./data` | Pasta do banco SQLite |
+| `SECTIONS` | Não | `DO1,DO1E` | Seções do DOU monitoradas |
+| `TZ` | Não | `America/Sao_Paulo` | Fuso horário |
+| `SESSION_TTL_MIN` | Não | `30` | Minutos reaproveitando a sessão logada |
+| `BLOCK_BACKOFF_MIN` | Não | `120` | Minutos de pausa ao detectar bloqueio do INLABS |
 
 ## Endpoints
 
-Todos, exceto `/health` e `/`, exigem o header `X-API-Key` (quando `API_KEY` está definida).
+| Método | Rota | Auth | Descrição |
+|---|---|---|---|
+| `GET` | `/` | Não | Info do serviço |
+| `GET` | `/health` | Não | Healthcheck |
+| `GET` | `/federal` | `X-API-Key` | Hoje + ontem, todas as seções configuradas |
+| `GET` | `/norms?date=YYYY-MM-DD&sections=DO1,DO1E` | `X-API-Key` | Data e seções específicas |
 
-| Método | Rota | Descrição |
-|--------|------|-----------|
-| GET | `/health` | Healthcheck (sem auth). |
-| GET | `/federal` | Itens de hoje + ontem, todas as seções configuradas. |
-| GET | `/norms?date=YYYY-MM-DD&sections=DO1,DO1E` | Data e seções específicas. |
+## Como integrar (consumir a API)
 
-### Exemplo
+Toda chamada que retorna dados exige o header `X-API-Key` com o valor definido no `.env`.
+
+### curl
 
 ```bash
-curl -H "X-API-Key: SUA_CHAVE" https://SEU-HOST/federal
+# Healthcheck (aberto)
+curl https://api.seudominio.com/health
+
+# Buscar itens de hoje + ontem (autenticado)
+curl -H "X-API-Key: sua-chave" https://api.seudominio.com/federal
+
+# Buscar data específica
+curl -H "X-API-Key: sua-chave" "https://api.seudominio.com/norms?date=2026-07-10&sections=DO1,DO1E"
 ```
 
-### Formato da resposta
+### Python
+
+```python
+import requests
+
+resp = requests.get(
+    "https://api.seudominio.com/federal",
+    headers={"X-API-Key": "sua-chave"}
+)
+data = resp.json()
+print(f"Status: {data['status']} — {data['count']} itens")
+for item in data["items"]:
+    print(item["title"], item["link"])
+```
+
+### Google Apps Script
+
+```javascript
+function buscarDou() {
+  var url = "https://api.seudominio.com/federal";
+  var options = {
+    headers: { "X-API-Key": "sua-chave" },
+    muteHttpExceptions: true
+  };
+  var resp = UrlFetchApp.fetch(url, options);
+  var data = JSON.parse(resp.getContentText());
+  // data.items contém o array de atos normativos
+  return data.items;
+}
+```
+
+## Formato da resposta
 
 ```json
 {
-  "status": "ok",            // ok | degraded | blocked
-  "generatedAt": "2026-07-09T22:00:00+00:00",
+  "status": "ok",
+  "generatedAt": "2026-07-10T14:00:00+00:00",
   "count": 42,
-  "sections": [{"date": "2026-07-09", "secao": "DO1", "count": 40, "cached": true}],
-  "blockedUntil": null,
+  "sections": [
+    {"date": "2026-07-10", "secao": "DO1", "count": 40, "cached": false}
+  ],
   "items": [
     {
       "source": "INLABS",
-      "externalId": "PRT456.xml@2026-07-09",
+      "externalId": "PRT456.xml@2026-07-10",
       "fileName": "PRT456.xml",
-      "title": "PORTARIA RFB Nº 456, DE 9 DE JULHO DE 2026",
+      "title": "PORTARIA Nº 456, DE 10 DE JULHO DE 2026",
       "subtitle": "",
-      "ementa": "Dispõe sobre despacho aduaneiro e a DUIMP...",
-      "orgao": "Ministério da Fazenda/Receita Federal do Brasil",
-      "textoResumo": "O SECRETÁRIO da Receita Federal resolve...",
-      "link": "https://www.in.gov.br/web/dou/-/portaria-rfb-no-456-de-2026",
-      "publishedAt": "2026-07-09T00:00:00",
-      "publishedIso": "2026-07-09T00:00:00",
+      "ementa": "Dispõe sobre...",
+      "orgao": "Ministério da Fazenda",
+      "textoResumo": "O SECRETÁRIO...",
+      "link": "https://www.in.gov.br/web/dou/-/portaria-456",
+      "publishedAt": "2026-07-10T00:00:00",
+      "publishedIso": "2026-07-10T00:00:00",
       "secao": "DO1",
-      "editionDate": "2026-07-09"
+      "editionDate": "2026-07-10"
     }
   ]
 }
 ```
 
-Campo `status`:
-- `ok` — dados atuais do INLABS (ou cache válido).
-- `degraded` — INLABS indisponível/bloqueado; servindo cache anterior.
-- `blocked` — INLABS bloqueado e sem cache para servir.
-
-## Variáveis de ambiente
-
-Veja `.env.example`. Obrigatórias: `INLABS_EMAIL`, `INLABS_PASSWORD`, `API_KEY`.
-
-| Variável | Padrão | Descrição |
-|----------|--------|-----------|
-| `INLABS_EMAIL` | — | E-mail da conta INLABS. |
-| `INLABS_PASSWORD` | — | Senha da conta INLABS. |
-| `API_KEY` | — | Chave exigida no header `X-API-Key`. Se vazia, a API fica aberta. |
-| `DATA_DIR` | `./data` | Diretório do banco SQLite. |
-| `SECTIONS` | `DO1,DO1E` | Seções coletadas. |
-| `TZ` | `America/Sao_Paulo` | Fuso para determinar "hoje"/"ontem". |
-| `SESSION_TTL_MIN` | `30` | Minutos que a sessão logada é reaproveitada. |
-| `BLOCK_BACKOFF_MIN` | `120` | Minutos de pausa ao detectar bloqueio. |
-
-> As credenciais do INLABS ficam **somente no ambiente**, nunca no código.
-
-## Rodar localmente
-
-```bash
-python -m venv .venv
-.venv/Scripts/pip install -r requirements.txt   # Linux/Mac: .venv/bin/pip
-cp .env.example .env                              # e preencha os valores
-.venv/Scripts/uvicorn app.main:app --reload      # Linux/Mac: .venv/bin/uvicorn
-```
-
-Docs interativas (Swagger UI) em `http://127.0.0.1:8000/docs`.
-
-## Deploy
-
-A aplicação é um serviço ASGI padrão (`app.main:app`), sem dependências além das do
-`requirements.txt`. Funciona em qualquer plataforma que rode Python.
-
-Comando de start:
-
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port $PORT
-```
-
-Para o cache persistir entre reinícios/deploys, aponte `DATA_DIR` para um diretório
-persistente (um volume). Sem isso, o cache ainda funciona, mas zera a cada deploy.
-
-## Stack
-
-FastAPI · Uvicorn · Requests · SQLite (stdlib). Python 3.12+.
+**Status possíveis:**
+- `ok` — dados atualizados do INLABS ou cache válido
+- `degraded` — INLABS indisponível/bloqueado, servindo cache do dia anterior
+- `blocked` — INLABS bloqueado e sem cache para servir
